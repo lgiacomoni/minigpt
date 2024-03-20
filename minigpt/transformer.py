@@ -5,26 +5,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 import optax
 import numpy as np
-import functools
 
-class Block(nn.Module):
-    """Transformer block: communication followed by computation """
-    num_heads: int
-    n_embd: int
-
-    @nn.compact
-    def __call__(self, x):
-        x = nn.LayerNorm(self.n_embd)(x)
-        x = x + nn.MultiHeadAttention(num_heads=self.num_heads, 
-                                      use_bias=False, 
-                                      attention_fn=functools.partial(nn.dot_product_attention,mask=nn.make_causal_mask(x))
-                                      )(x)
-        x = nn.Dense(self.n_embd)(x)
-        x = nn.LayerNorm(self.n_embd)(x)
-        x = x + nn.Sequential([nn.Dense(4*self.n_embd), nn.relu, nn.Dense(self.n_embd)])(x)
-
-        return x
-    
 class FeedForward(nn.Module):
     """Position-wise feed-forward layer"""
     n_embd: int
@@ -73,14 +54,11 @@ class MultiHeadAttention(nn.Module):
        wei = jnp.where(trill == 0, -jnp.inf, wei) # (B,T,T)
        wei = jax.nn.softmax(wei, axis=-1) # (B,H,T,T)
 
-       
       # Perform weighted aggregation of values
        wei = jnp.einsum('...hqk,...khd->...qhd', wei, value)
-       wei = nn.DenseGeneral(features=x.shape[-1], axis=(-2,-1), use_bias=False)(wei) # (B,T,C)
-       out = nn.Dense(x.shape[-1], use_bias=False)(wei) # (B,T,C)
+       out = nn.DenseGeneral(features=x.shape[-1], axis=(-2,-1), use_bias=False)(wei) # (B,T,C)
+    #    out = nn.Dense(x.shape[-1], use_bias=False)(wei) # (B,T,C)
        return out
-
-
 
 class Block(nn.Module):
    n_embd: int
@@ -88,10 +66,12 @@ class Block(nn.Module):
 
    @nn.compact
    def __call__(self, x):
-      x = nn.LayerNorm(self.n_embd)(x)
+    #   x = nn.LayerNorm(self.n_embd, use_bias=False, use_fast_variance=False)(x)
       x = x + MultiHeadAttention(self.n_head)(x)
-      x = nn.LayerNorm(self.n_embd)(x)
+    #   x =  MultiHeadAttention(self.n_head)(x)
+    #   x = nn.LayerNorm(self.n_embd, use_bias=False, use_fast_variance=False)(x)
       x = x + FeedForward(self.n_embd)(x)
+    #   x = FeedForward(self.n_embd)(x)
       return x
 
 class BigramLanguageModel(nn.Module):
@@ -114,7 +94,7 @@ class BigramLanguageModel(nn.Module):
     x = Block(self.n_embd, self.num_heads)(x)
     x = Block(self.n_embd, self.num_heads)(x)
     x = Block(self.n_embd, self.num_heads)(x)
-    x = nn.LayerNorm(self.n_embd)(x) # (B,T,C)
+    # x = nn.LayerNorm(self.n_embd, use_bias=False, use_fast_variance=False)(x) # (B,T,C)
     logits = nn.Dense(self.vocab_size, use_bias=False)(x) # (B,T,C)
 
     return logits
@@ -200,18 +180,18 @@ def masked_fill(mask,a,fill_value):
 if __name__ == '__main__':
     # Initialise optimiser params
     start_learning_rate = 1e-3
-    batch_size = 32 # Number of independent sequences we will process in parallel
-    block_size = 256 # Maximum context length of predictions
+    batch_size = 64 # Number of independent sequences we will process in parallel
+    block_size = 128 # Maximum context length of predictions
     seed = 1337
     max_iters = 5000
     eval_interval = 500
     vocab_size = 65
     n_embd = 384
-    n_head = 6
+    n_head = 8
 
     np.random.seed(seed)
    
-    text = load_data('input.txt')
+    text = load_data('data/input.txt')
     chars = sorted(list(set(text)))
     vocab_size = len(chars)
 
@@ -240,7 +220,7 @@ if __name__ == '__main__':
     # Initialise model parameters
     params = jax.device_put(model.init(init_key, xb))
 
-    optimizer = optax.adamw(learning_rate=start_learning_rate)
+    optimizer = optax.adam(learning_rate=start_learning_rate)
     opt_state = jax.device_put(optimizer.init(params))
 
     loss_fn = jax.jit(create_loss_fn(model),  device=jax.devices('gpu')[0])
