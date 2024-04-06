@@ -1,49 +1,30 @@
 from flax import linen as nn
+import flax
 import math
 import jax
 import jax.numpy as jnp
 
-
+@flax.struct.dataclass
+class ModelConfig:
+    vocab_size: int
+    n_embd: int
+    block_size: int
+    n_head: int
+    n_blocks: int
+    
+    
 class CausalSelfAttention(nn.Module):
     n_embd: int
     n_head: int
     block_size: int
 
-    # def setup(self) -> None:
-    #     # key, query, value projections for all heads, but in a batch
-    #     self.c_attn = nn.Dense(3 * self.n_embd, use_bias=False)
-    #      # output projection
-    #     self.c_proj = nn.Dense(self.n_embd, use_bias=False)
-    #     self.bias =  jnp.tril(jnp.ones((self.block_size, self.block_size))).reshape((1, 1, self.block_size, self.block_size))
-
-    # def __call__(self, x):
-    #     B, T, C = x.shape # batch size, sequence length, embedding dimensionality (n_embd)
-
-    #     # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-    #     q, k, v  = jnp.split(self.c_attn(x), 3, axis=2)
-    #     k = k.reshape((B, T, self.n_head, C // self.n_head)).transpose([0, 2, 1, 3]) # (B, nh, T, hs)
-    #     q = q.reshape((B, T, self.n_head, C // self.n_head)).transpose([0, 2, 1, 3]) # (B, nh, T, hs)
-    #     v = v.reshape((B, T, self.n_head, C // self.n_head)).transpose([0, 2, 1, 3]) # (B, nh, T, hs)
-
-    #     # manual implementation of attention
-    #     # # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-    #     att = (q @ k.transpose([0,1,3,2])) * (1.0 / math.sqrt(k.shape[-1]))
-    #     att = jnp.where(self.bias[:,:,:T,:T] == 0, -jnp.inf, att)
-    #     att = jax.nn.softmax(att, axis=-1)
-    #     # att = self.attn_dropout(att)
-    #     y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-    #     y = y.transpose([0, 2, 1, 3]).reshape((B, T, C)) # re-assemble all head outputs side by side
-
-    #     # output projection
-    #     # y = self.resid_dropout(self.c_proj(y))
-    #     y = self.c_proj(y)
-    #     return y
     def setup(self):
         self.query = nn.DenseGeneral(features=(self.n_head, self.n_embd // self.n_head), axis=-1, use_bias=False)
         self.key = nn.DenseGeneral(features=(self.n_head, self.n_embd // self.n_head), axis=-1, use_bias=False)
         self.value = nn.DenseGeneral(features=(self.n_head, self.n_embd // self.n_head), axis=-1, use_bias=False)
         self.c_proj1 = nn.DenseGeneral(features=self.n_embd, axis=(-2,-1), use_bias=False)
         self.c_proj2 =  nn.Dense(self.n_embd , use_bias=False)
+        
     def __call__(self, x):
        head_dim = self.n_embd // self.n_head
        # Project the input to the query, key, and value tensors for each head
@@ -53,7 +34,7 @@ class CausalSelfAttention(nn.Module):
 
        # Compute the attention scores ("affinities")
        wei = jnp.einsum('...qhd,...khd->...hqk', query, key)*head_dim**-0.5 # (B,H,T,T)
-       trill = jnp.tril(jnp.ones((x.shape[1],x.shape[1]))) # (T,T)
+       trill = jnp.tril(jnp.ones((self.block_size,self.block_size))) # (T,T)
        wei = jnp.where(trill == 0, -jnp.inf, wei) # (B,T,T)
        wei = jax.nn.softmax(wei, axis=-1) # (B,H,T,T)
 
@@ -93,8 +74,9 @@ class Block(nn.Module):
         self.mlp = MLP(self.n_embd)
 
     def __call__(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        res = x
+        x = res + self.attn(self.ln_1(x))
+        x = res + self.mlp(self.ln_2(x))
         return x
     
 class GPT(nn.Module):
@@ -107,7 +89,6 @@ class GPT(nn.Module):
     def setup(self):
 
         self.token_emb = nn.Embed(self.vocab_size, self.n_embd)# (B,T,C) with C: embedding size/channels
-        # TODO: improve position embedding
         self.position_emb = nn.Embed(self.block_size, self.n_embd) # (T,C)
         self.blocks = [Block(self.n_embd, self.n_heads, self.block_size) for _ in range(self.n_blocks)]
         self.ln_f = nn.LayerNorm(use_bias=False)
@@ -124,9 +105,9 @@ class GPT(nn.Module):
         x = tok_emb + pos_emb
         for block in self.blocks:
             x = block(x)
+            
         x = self.ln_f(x)
-
-
+        
         # inference-time mini-optimization: only forward the lm_head on the very last position
         logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
         return logits

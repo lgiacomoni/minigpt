@@ -1,52 +1,113 @@
+from typing import Callable, List, Tuple
+
 import jax
 import jax.numpy as jnp
-import model as gpt
+from model import Gpt, generate, ModelConfig
 import optax
 import numpy as np
 from flax.training import train_state  # a useful dataclass to keep train state
 from functools import partial
+from flax import linen as nn
+import orbax.checkpoint as ocp
+import flax
 
+TRAIN_SPLIT = 'train'
+VAL_SPLIT = 'val'
 
-def get_batch(key, split, data, block_size, batch_size, device):
-  data = data[split]
-  ix = jax.random.randint(key,  (batch_size,), 0,  len(data) - block_size, dtype=jnp.int32)
-  x = jnp.stack([data[i:i+block_size] for i in ix])
-  y =  jnp.stack([data[i+1:i+block_size+1] for i in ix])
-  return jax.device_put(x,device=device), jax.device_put(y, device=device)
+@flax.struct.dataclass
+class TrainConfig:
+    start_learning_rate: float
+    batch_size: int
+    seed: int
+    max_iters: int
+    eval_interval: int
+
+def get_batch(key: jax.random.PRNGKey, split: str, data: jnp.ndarray, block_size: int, batch_size: int, device: jax.Device) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Get a batch of data.
+
+    Args:
+        key: the random key
+        split: the split of the data to get the batch from
+        data: the data
+        block_size: the block size
+        batch_size: the batch size
+        device: the device to put the data on
+
+    Returns:
+        A tuple of the input and target data.
+    """
+    data = data[split]
+    ix = jax.random.randint(key,  (batch_size,), 0,  len(data) - block_size, dtype=jnp.int32)
+    x = jnp.stack([data[i:i+block_size] for i in ix])
+    y =  jnp.stack([data[i+1:i+block_size+1] for i in ix])
+    return jax.device_put(x,device=device), jax.device_put(y, device=device)
 
 
 @jax.jit
 @jax.vmap
-def compute_loss(logits, targets): # (T,C),(T,)
-      n_classes = logits.shape[-1]
-      loss = optax.softmax_cross_entropy(logits, jax.nn.one_hot(targets, n_classes))
-      return loss
+def compute_loss(logits: jnp.ndarray, targets: jnp.ndarray) -> float: # (T,C),(T,)
+    """Computes the loss between the logits and the targets.
+
+    Args:
+        logits: the model predictions
+        targets: the target values
+
+    Returns:
+        The loss value.
+    """
+    n_classes = logits.shape[-1]
+    loss = optax.softmax_cross_entropy(logits, jax.nn.one_hot(targets, n_classes))
+    return loss
 
 @jax.jit
-def train_step(state, xs, ys): # [TrainState, (B,T,C), (B,T)] -> TrainState, float 
-    # TODO: When the model is relatively small, a pmap of train step would allow to train in parallel over multiple batches. However, this requires
-    # replication of the model params across devices. This is not possible with very large models. Instead, a single very large model should be trained
-    # by splitting a single model into multiple logical parts. 
-    
-    def loss_fn(params):
-        logits = state.apply_fn(params, xs)
-        loss = jnp.mean(compute_loss(logits, ys))
-        return loss, logits
-  
-    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    state = state.apply_gradients(grads=grads)  # this is the whole update now! concise!
-    return state, loss
+def eval_step(state: train_state.TrainState, xs: jnp.ndarray, ys: jnp.ndarray) -> float: # state, (B,T,C), (B,T)
+    """Computes the loss.
 
-@jax.jit
-def eval_step(state, xs, ys): # state, (B,T,C), (B,T)
+    Args:
+        state: the TrainState
+        xs: the input data
+        ys: the target data
+
+    Returns:
+        The loss value.
+    """
     logits = state.apply_fn(state.params, xs)
     loss = jnp.mean(compute_loss(logits, ys))
     return loss
 
+@jax.jit
+def train_step(state: train_state.TrainState, xs: jnp.ndarray, ys: jnp.ndarray): # [TrainState, (B,T,C), (B,T)] -> TrainState, float 
+    """Performs a single training step.
+    Args:
+        state: the TrainState
+        xs: the input data
+        ys: the target data
+    
+    Returns:
+        A tuple of the new TrainState and the loss value.
+    """
+    def loss_fn(params):
+        logits = state.apply_fn(params, xs)
+        loss = jnp.mean(compute_loss(logits, ys))
+        return loss
+  
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    state = state.apply_gradients(grads=grads)  # this is the whole update now! concise!
+    return state, loss
 
 def train_one_epoch(key, state, data, get_batch):
-    """Train for 1 epoch on the training set."""
-    xs,ys = get_batch(key, 'train', data)
+    """Trains the model for one epoch.
+
+    Args:
+        key: the random key
+        state: the TrainState
+        data: the data
+        get_batch: the function to get a batch of data
+
+    Returns:
+        The new TrainState and the average loss value.
+    """
+    xs,ys = get_batch(key, TRAIN_SPLIT, data)
     state, loss = train_step(state, xs, ys)
 
     # Aggregate the metrics
@@ -58,7 +119,15 @@ def load_data(path):
         text = fin.read()
     return text
 
-def create_encoder_decoder_fns(chars):
+def create_encoder_decoder_fns(chars: List[str]) -> Tuple[Callable[[str],List[int]], Callable[[List[int]], str]]:
+    """Create encoder and decoder functions.
+
+    Args:
+        chars: the characters to encode
+
+    Returns:
+        A tuple of the encode and decode functions.
+    """
     stoi = {char:code for code,char in enumerate(chars)}
     itos = {code:char for code,char in enumerate(chars)}
 
@@ -67,24 +136,53 @@ def create_encoder_decoder_fns(chars):
 
     return encode, decode
 
-def train_val_split(data, split=0.9):
+def train_val_split(data: np.array, split: float =0.9):
+    """Split the data into training and validation sets.
+
+    Args:
+        data: the data
+        split: the split ratio
+
+    Returns:
+        A dictionary with the training and validation data.
+    """
     n = int(split*len(data))
     train_data = data[:n]
     val_data = data[n:]
 
-    data = {'train': train_data, 'val': val_data}
+    data = {TRAIN_SPLIT: train_data, VAL_SPLIT: val_data}
     return data
 
-# This one will keep things nice and tidy compared to our previous examples
-def create_train_state(key, model, input, learning_rate):
+def create_train_state(key: jax.random.PRNGKey, model: nn.Module, input: jnp.ndarray, learning_rate:float):
+    """Create the TrainState.
+
+    Args:
+        key: the random key
+        model: the model
+        input: the input data
+        learning_rate: the learning rate
+    Returns:
+        The TrainState.
+    """
     params = model.init(key, input)
     sgd_opt = optax.adam(learning_rate)
     # TrainState is a simple built-in wrapper class that makes things a bit cleaner
     return train_state.TrainState.create(apply_fn=jax.jit(model.apply), params=params, tx=sgd_opt)
 
-def estimate_loss(key, state, data, get_batch, eval_iters=200):
+def estimate_loss(key: jax.random.PRNGKey, state: train_state.TrainState, data: np.array, get_batch: Callable, eval_iters: int=200) -> dict:
+    """Estimate the loss.
+
+    Args:
+        key: the random key
+        state: the TrainState
+        data: the data
+        get_batch: the function to get a batch
+
+    Returns:
+        A dictionary with the training and validation loss.
+    """
     out = {}
-    for split in ['train', 'val']:
+    for split in [TRAIN_SPLIT, VAL_SPLIT]:
         losses = np.zeros(eval_iters)
         for i in range(eval_iters):
            xs, ys = get_batch(key, split, data)
@@ -94,20 +192,19 @@ def estimate_loss(key, state, data, get_batch, eval_iters=200):
     return out
 
 def run():
-    # Initialise optimiser params
-    start_learning_rate = 1e-3
-    batch_size = 16 # Number of independent sequences we will process in parallel
-    block_size = 32 # Maximum context length of predictions
-    seed = 1337
-    max_iters = 1000
-    eval_interval = 100
-    vocab_size = 65
-    n_embd = 64
-    n_head = 4
-    n_blocks = 4
-
-
-    text = load_data('input.txt')
+    train_config = TrainConfig(start_learning_rate=1e-4, 
+                               batch_size=64, 
+                               seed=1337, 
+                               max_iters=5000, 
+                               eval_interval=500)
+    
+    model_config = ModelConfig(vocab_size=65, 
+                               n_embd=384, 
+                               block_size=128, 
+                               n_head=8, 
+                               n_blocks=6)
+    
+    text = load_data('data/input.txt')
     chars = sorted(list(set(text)))
     vocab_size = len(chars)
 
@@ -117,26 +214,32 @@ def run():
     data = np.array(encode(text), dtype=np.int32) #TODO: setting jnp.int64 returns a warning about downsizing and requiring an env variable to be set in order to use int64
     data = train_val_split(data, split=0.9)
 
-    init_key, train_key = jax.random.split(jax.random.PRNGKey(seed))
+    init_key, train_key = jax.random.split(jax.random.PRNGKey(train_config.seed))
 
     
-    xb, _ = get_batch(init_key, 'train', data, block_size, batch_size, jax.devices('gpu')[0])
+    xb, _ = get_batch(init_key, TRAIN_SPLIT, data, model_config.block_size, train_config.batch_size, jax.devices('gpu')[0])
 
 
-    model = gpt.GPT(vocab_size=vocab_size, block_size=block_size, n_embd=n_embd, n_heads=n_head, n_blocks=n_blocks)
-    train_state = create_train_state(init_key, model, xb, start_learning_rate)
+    model = Gpt(vocab_size=vocab_size, block_size=model_config.block_size, n_embd=model_config.n_embd, num_heads=model_config.n_head, n_blocks=model_config.n_blocks)
+    train_state = create_train_state(init_key, model, xb, train_config.start_learning_rate)
     
-    for epoch in range(1, max_iters + 1):
+    # Set up checkpointing
+    options = ocp.CheckpointManagerOptions(max_to_keep=1)
+    mngr = ocp.CheckpointManager( options=options)
+
+    for epoch in range(1, train_config.max_iters + 1):
         train_key, key1, key2 = jax.random.split(train_key, num=3)
 
-        train_state, _ = train_one_epoch(key1, train_state, data,partial(get_batch, block_size=block_size, batch_size=batch_size, device= jax.devices('gpu')[0]))
-        if epoch % eval_interval == 0:
-            losses = estimate_loss(key2, train_state, data, partial(get_batch, block_size=block_size, batch_size=batch_size, device= jax.devices('gpu')[0]))
-            print(f"Train epoch: {epoch}, loss: {losses['train']}")
-            print(f"Test epoch: {epoch}, loss: {losses['val']}")
+        train_state, _ = train_one_epoch(key1, train_state, data,partial(get_batch, block_size=model_config.block_size, batch_size=train_config.batch_size, device= jax.devices('gpu')[0]))
+        if epoch % train_config.eval_interval == 0:
+            losses = estimate_loss(key2, train_state, data, partial(get_batch, block_size=model_config.block_size, batch_size=train_config.batch_size, device= jax.devices('gpu')[0]))
+            print(f"Epoch: {epoch}, Train loss: {losses[TRAIN_SPLIT]}, Val loss: {losses[VAL_SPLIT]}")
+            ckpt = {"state": train_state, "config": {"train_config": train_config, "model_config": model_config}}
+            mngr.save(epoch, args=ocp.args.StandardSave(ckpt))
+                
 
     idx = jnp.zeros((1,1), dtype=jnp.int32, device=jax.devices('gpu')[0])
-    print(decode(gpt.generate(train_key, train_state, idx, block_size, max_new_tokens=500)[0].tolist())) 
+    print(decode(generate(train_key, train_state, idx, model_config.block_size, max_new_tokens=500)[0].tolist())) 
 
 if __name__ == '__main__':
     run()
