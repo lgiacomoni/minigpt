@@ -5,11 +5,13 @@ import jax.numpy as jnp
 from model import Gpt, generate, ModelConfig
 import optax
 import numpy as np
-from flax.training import train_state  # a useful dataclass to keep train state
+from flax.training.train_state import TrainState  # a useful dataclass to keep train state
 from functools import partial
 from flax import linen as nn
 import orbax.checkpoint as ocp
 import flax
+from etils import epath
+from flax.training import orbax_utils
 
 TRAIN_SPLIT = 'train'
 VAL_SPLIT = 'val'
@@ -21,6 +23,7 @@ class TrainConfig:
     seed: int
     max_iters: int
     eval_interval: int
+    model_config: ModelConfig
 
 def get_batch(key: jax.random.PRNGKey, split: str, data: jnp.ndarray, block_size: int, batch_size: int, device: jax.Device) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Get a batch of data.
@@ -60,7 +63,7 @@ def compute_loss(logits: jnp.ndarray, targets: jnp.ndarray) -> float: # (T,C),(T
     return loss
 
 @jax.jit
-def eval_step(state: train_state.TrainState, xs: jnp.ndarray, ys: jnp.ndarray) -> float: # state, (B,T,C), (B,T)
+def eval_step(state: TrainState, xs: jnp.ndarray, ys: jnp.ndarray) -> float: # state, (B,T,C), (B,T)
     """Computes the loss.
 
     Args:
@@ -76,7 +79,7 @@ def eval_step(state: train_state.TrainState, xs: jnp.ndarray, ys: jnp.ndarray) -
     return loss
 
 @jax.jit
-def train_step(state: train_state.TrainState, xs: jnp.ndarray, ys: jnp.ndarray): # [TrainState, (B,T,C), (B,T)] -> TrainState, float 
+def train_step(state: TrainState, xs: jnp.ndarray, ys: jnp.ndarray): # [TrainState, (B,T,C), (B,T)] -> TrainState, float 
     """Performs a single training step.
     Args:
         state: the TrainState
@@ -153,7 +156,7 @@ def train_val_split(data: np.array, split: float =0.9):
     data = {TRAIN_SPLIT: train_data, VAL_SPLIT: val_data}
     return data
 
-def create_train_state(key: jax.random.PRNGKey, model: nn.Module, input: jnp.ndarray, learning_rate:float):
+def create_train_state(key: jax.random.PRNGKey, model: nn.Module, train_config: TrainConfig):
     """Create the TrainState.
 
     Args:
@@ -164,12 +167,15 @@ def create_train_state(key: jax.random.PRNGKey, model: nn.Module, input: jnp.nda
     Returns:
         The TrainState.
     """
-    params = model.init(key, input)
-    sgd_opt = optax.adam(learning_rate)
+    input_sample = jnp.ones((train_config.batch_size, train_config.model_config.block_size), dtype=jnp.int32)
+    params = model.init(key, input_sample)
+    del input_sample
+    
+    sgd_opt = optax.adam(train_config.start_learning_rate)
     # TrainState is a simple built-in wrapper class that makes things a bit cleaner
-    return train_state.TrainState.create(apply_fn=jax.jit(model.apply), params=params, tx=sgd_opt)
+    return TrainState.create(apply_fn=jax.jit(model.apply), params=params, tx=sgd_opt)
 
-def estimate_loss(key: jax.random.PRNGKey, state: train_state.TrainState, data: np.array, get_batch: Callable, eval_iters: int=200) -> dict:
+def estimate_loss(key: jax.random.PRNGKey, state: TrainState, data: np.array, get_batch: Callable, eval_iters: int=200) -> dict:
     """Estimate the loss.
 
     Args:
@@ -191,19 +197,35 @@ def estimate_loss(key: jax.random.PRNGKey, state: train_state.TrainState, data: 
         out[split] = losses.mean()
     return out
 
+def train_model(train_key: jax.random.PRNGKey,  data: np.array, train_config: TrainConfig,  state: TrainState, mngr: ocp.CheckpointManager):   
+    for epoch in range(1, train_config.max_iters + 1):
+        train_key, key1, key2 = jax.random.split(train_key, num=3)
+
+        state, _ = train_one_epoch(key1, state, data,partial(get_batch, block_size=train_config.model_config.block_size, batch_size=train_config.batch_size, device= jax.devices('gpu')[0]))
+        if epoch % train_config.eval_interval == 0:
+            losses = estimate_loss(key2, state, data, partial(get_batch, block_size=train_config.model_config.block_size, batch_size=train_config.batch_size, device= jax.devices('gpu')[0]))
+            print(f"Epoch: {epoch}, Train loss: {losses[TRAIN_SPLIT]}, Val loss: {losses[VAL_SPLIT]}")
+            ckpt = {"params": state.params}
+            save_args = orbax_utils.save_args_from_target(ckpt)
+            mngr.save(epoch, ckpt, save_kwargs={'save_args': save_args})
+    
+    return state
+                
+
 def run():
+    eval = True
     train_config = TrainConfig(start_learning_rate=1e-4, 
                                batch_size=64, 
                                seed=1337, 
-                               max_iters=5000, 
-                               eval_interval=500)
-    
-    model_config = ModelConfig(vocab_size=65, 
-                               n_embd=384, 
-                               block_size=128, 
-                               n_head=8, 
-                               n_blocks=6)
-    
+                               max_iters=500, 
+                               eval_interval=500,
+                               model_config=ModelConfig(vocab_size=65, 
+                                                        n_embd=384, 
+                                                        block_size=128, 
+                                                        n_head=8, 
+                                                        n_blocks=6)
+                               )
+        
     text = load_data('data/input.txt')
     chars = sorted(list(set(text)))
     vocab_size = len(chars)
@@ -213,33 +235,28 @@ def run():
      # Encoded dataset
     data = np.array(encode(text), dtype=np.int32) #TODO: setting jnp.int64 returns a warning about downsizing and requiring an env variable to be set in order to use int64
     data = train_val_split(data, split=0.9)
-
+    
     init_key, train_key = jax.random.split(jax.random.PRNGKey(train_config.seed))
-
     
-    xb, _ = get_batch(init_key, TRAIN_SPLIT, data, model_config.block_size, train_config.batch_size, jax.devices('gpu')[0])
-
-
-    model = Gpt(vocab_size=vocab_size, block_size=model_config.block_size, n_embd=model_config.n_embd, num_heads=model_config.n_head, n_blocks=model_config.n_blocks)
-    train_state = create_train_state(init_key, model, xb, train_config.start_learning_rate)
+    model = Gpt(vocab_size=vocab_size, block_size=train_config.model_config.block_size, n_embd=train_config.model_config.n_embd, n_heads=train_config.model_config.n_head, n_blocks=train_config.model_config.n_blocks)
+    train_state = create_train_state(init_key, model, train_config)#
     
-    # Set up checkpointing
     options = ocp.CheckpointManagerOptions(max_to_keep=1)
-    mngr = ocp.CheckpointManager( options=options)
+    mngr = ocp.CheckpointManager(epath.Path('/home/l-giacomoni/minigpt/checkpoints'), ocp.PyTreeCheckpointer(),options=options)
 
-    for epoch in range(1, train_config.max_iters + 1):
-        train_key, key1, key2 = jax.random.split(train_key, num=3)
-
-        train_state, _ = train_one_epoch(key1, train_state, data,partial(get_batch, block_size=model_config.block_size, batch_size=train_config.batch_size, device= jax.devices('gpu')[0]))
-        if epoch % train_config.eval_interval == 0:
-            losses = estimate_loss(key2, train_state, data, partial(get_batch, block_size=model_config.block_size, batch_size=train_config.batch_size, device= jax.devices('gpu')[0]))
-            print(f"Epoch: {epoch}, Train loss: {losses[TRAIN_SPLIT]}, Val loss: {losses[VAL_SPLIT]}")
-            ckpt = {"state": train_state, "config": {"train_config": train_config, "model_config": model_config}}
-            mngr.save(epoch, args=ocp.args.StandardSave(ckpt))
-                
-
-    idx = jnp.zeros((1,1), dtype=jnp.int32, device=jax.devices('gpu')[0])
-    print(decode(generate(train_key, train_state, idx, model_config.block_size, max_new_tokens=500)[0].tolist())) 
-
+    
+    if eval:
+        # Load the model
+        ckpt = mngr.restore(mngr.latest_step())
+        params = ckpt['params']
+        model.init(train_key, jnp.ones((train_config.batch_size,train_config.model_config.block_size), dtype=jnp.int32))
+        idx = jnp.zeros((1,1), dtype=jnp.int32, device=jax.devices('gpu')[0])
+        print(decode(generate(train_key, model, params, idx, train_config.model_config.block_size, max_new_tokens=500)[0].tolist())) 
+        
+    else:
+        train_state = train_model(train_key, data, train_config, train_state, mngr)
+   
+    
+        
 if __name__ == '__main__':
     run()
