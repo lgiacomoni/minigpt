@@ -217,7 +217,7 @@ def run():
     train_config = TrainConfig(start_learning_rate=1e-4, 
                                batch_size=64, 
                                seed=1337, 
-                               max_iters=500, 
+                               max_iters=5000, 
                                eval_interval=500,
                                model_config=ModelConfig(vocab_size=65, 
                                                         n_embd=384, 
@@ -249,8 +249,8 @@ def run():
         # Load the model
         ckpt = mngr.restore(mngr.latest_step())
         params = ckpt['params']
-        model.init(train_key, jnp.ones((train_config.batch_size,train_config.model_config.block_size), dtype=jnp.int32))
-        idx = jnp.zeros((1,1), dtype=jnp.int32, device=jax.devices('gpu')[0])
+        # idx = jnp.zeros((1,1), dtype=jnp.int32, device=jax.devices('gpu')[0])
+        idx = jnp.asarray([encode("LUCA:\nWhere are we going?\n\nMARIO:")], dtype=jnp.int32)
         print(decode(generate(train_key, model, params, idx, train_config.model_config.block_size, max_new_tokens=500)[0].tolist())) 
         
     else:
