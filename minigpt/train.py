@@ -79,7 +79,7 @@ def eval_step(state: TrainState, xs: jnp.ndarray, ys: jnp.ndarray) -> float: # s
     return loss
 
 @jax.jit
-def train_step(state: TrainState, xs: jnp.ndarray, ys: jnp.ndarray): # [TrainState, (B,T,C), (B,T)] -> TrainState, float 
+def train_step(state: TrainState, xs: jnp.ndarray, ys: jnp.ndarray, droput_key: jax.random.PRNGKey): # [TrainState, (B,T,C), (B,T)] -> TrainState, float 
     """Performs a single training step.
     Args:
         state: the TrainState
@@ -90,12 +90,12 @@ def train_step(state: TrainState, xs: jnp.ndarray, ys: jnp.ndarray): # [TrainSta
         A tuple of the new TrainState and the loss value.
     """
     def loss_fn(params):
-        logits = state.apply_fn(params, xs)
+        logits = state.apply_fn(params, xs, rngs={"dropout": droput_key})
         loss = jnp.mean(compute_loss(logits, ys))
         return loss
   
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    state = state.apply_gradients(grads=grads)  # this is the whole update now! concise!
+    state = state.apply_gradients(grads=grads) 
     return state, loss
 
 def train_one_epoch(key, state, data, get_batch):
@@ -110,8 +110,9 @@ def train_one_epoch(key, state, data, get_batch):
     Returns:
         The new TrainState and the average loss value.
     """
-    xs,ys = get_batch(key, TRAIN_SPLIT, data)
-    state, loss = train_step(state, xs, ys)
+    batch_key, dropout_key = jax.random.split(key)   
+    xs,ys = get_batch(batch_key, TRAIN_SPLIT, data)
+    state, loss = train_step(state, xs, ys, dropout_key)
 
     # Aggregate the metrics
     loss = jax.device_get(loss)  # pull from the accelerator onto host (CPU)
@@ -213,7 +214,7 @@ def train_model(train_key: jax.random.PRNGKey,  data: np.array, train_config: Tr
                 
 
 def run():
-    eval = True
+    eval = False
     train_config = TrainConfig(start_learning_rate=1e-4, 
                                batch_size=64, 
                                seed=1337, 
@@ -223,7 +224,9 @@ def run():
                                                         n_embd=384, 
                                                         block_size=128, 
                                                         n_head=8, 
-                                                        n_blocks=6)
+                                                        n_blocks=6,
+                                                        dropout_rate=0.2
+                                                        )
                                )
         
     text = load_data('data/input.txt')
@@ -238,20 +241,34 @@ def run():
     
     init_key, train_key = jax.random.split(jax.random.PRNGKey(train_config.seed))
     
-    model = Gpt(vocab_size=vocab_size, block_size=train_config.model_config.block_size, n_embd=train_config.model_config.n_embd, n_heads=train_config.model_config.n_head, n_blocks=train_config.model_config.n_blocks)
-    train_state = create_train_state(init_key, model, train_config)#
+    model_training = Gpt(vocab_size=vocab_size, 
+                block_size=train_config.model_config.block_size, 
+                n_embd=train_config.model_config.n_embd, 
+                n_heads=train_config.model_config.n_head, 
+                n_blocks=train_config.model_config.n_blocks,
+                train=True,
+                dropout_rate=train_config.model_config.dropout_rate)
+    
+    train_state = create_train_state(init_key, model_training, train_config)
     
     options = ocp.CheckpointManagerOptions(max_to_keep=1)
     mngr = ocp.CheckpointManager(epath.Path('/home/l-giacomoni/minigpt/checkpoints'), ocp.PyTreeCheckpointer(),options=options)
 
     
     if eval:
+        model_eval = Gpt(vocab_size=vocab_size, 
+                block_size=train_config.model_config.block_size, 
+                n_embd=train_config.model_config.n_embd, 
+                n_heads=train_config.model_config.n_head, 
+                n_blocks=train_config.model_config.n_blocks,
+                train=False,
+                dropout_rate=train_config.model_config.dropout_rate)
+        
         # Load the model
         ckpt = mngr.restore(mngr.latest_step())
         params = ckpt['params']
-        # idx = jnp.zeros((1,1), dtype=jnp.int32, device=jax.devices('gpu')[0])
-        idx = jnp.asarray([encode("LUCA:\nWhere are we going?\n\nMARIO:")], dtype=jnp.int32)
-        print(decode(generate(train_key, model, params, idx, train_config.model_config.block_size, max_new_tokens=500)[0].tolist())) 
+        idx = jnp.zeros((1,1), dtype=jnp.int32, device=jax.devices('gpu')[0])
+        print(decode(generate(train_key, model_eval, params, idx, train_config.model_config.block_size, max_new_tokens=500)[0].tolist())) 
         
     else:
         train_state = train_model(train_key, data, train_config, train_state, mngr)
